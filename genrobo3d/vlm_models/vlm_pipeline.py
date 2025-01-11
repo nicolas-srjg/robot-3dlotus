@@ -185,15 +185,16 @@ class VLMPipeline(object):
         for obj in objects:
             if obj.image_class_embeds is None:  # obstacle
                 # assert isinstance(obj.captions, list) and obj.captions[0] == 'obstacle'
-                continue
+                it_sims.append(-1)
+            else:
             # image_class_embeds = obj.image_class_embeds
-            image_class_embeds = weighted_average_embeds(
-                obj.image_class_embeds, obj.objectness_scores, keepdim=False
-            )
-            image_class_embeds = image_class_embeds / (torch.linalg.norm(image_class_embeds, dim=-1, keepdim=True) + 1e-6)
-            it_sims.append(
-                (query_embeds * image_class_embeds).sum().item()
-            )
+                image_class_embeds = weighted_average_embeds(
+                    obj.image_class_embeds, obj.objectness_scores, keepdim=False
+                )
+                image_class_embeds = image_class_embeds / (torch.linalg.norm(image_class_embeds, dim=-1, keepdim=True) + 1e-6)
+                it_sims.append(
+                    (query_embeds * image_class_embeds).sum().item()
+                )
 
         # # TODO: for some tasks there is only 1 object in the scene
         # if 'drawer' in text or 'laptop' in text or 'shelf' in text or 'safe' in text \

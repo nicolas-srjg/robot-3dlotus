@@ -61,7 +61,7 @@ TRAIN_DATASET:
   pc_label_type: 'coarse' # coarse, fine, mix
   pc_label_augment: 0.0
   pc_midstep_augment: True
-  use_color: False
+  use_color: True
   instr_include_objects: False
   real_robot: False
 
@@ -95,7 +95,7 @@ VAL_DATASET:
   pc_label_type: 'coarse' # coarse, fine, mix
   pc_label_augment: 0.0
   pc_midstep_augment: True
-  use_color: False
+  use_color: True
   instr_include_objects: False
   real_robot: False
   

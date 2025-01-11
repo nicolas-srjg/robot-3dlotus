@@ -114,6 +114,7 @@ def main(config):
     model_class = MODEL_FACTORY[config.MODEL.model_class]
     model = model_class(config.MODEL)
     # DDP: SyncBN
+    config.world_size = 1
     if config.world_size > 1:
         model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
 

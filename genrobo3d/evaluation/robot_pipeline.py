@@ -6,7 +6,7 @@ from easydict import EasyDict
 import copy
 import collections
 from scipy.spatial.transform import Rotation as R
-
+import scipy
 import torch
 
 from genrobo3d.configs.rlbench.constants import get_robot_workspace
@@ -50,7 +50,7 @@ class RobotPipeline(object):
 
         # build VLM for coarse-grained object grounding
         self.vlm_pipeline = VLMPipeline(
-            sam_model_id="huge", det_model_id="large",
+            sam_model_id="base", det_model_id="base",
             use_2d_caption=False, use_3d_caption=False,
             env_name=self.env_name
         )
@@ -187,6 +187,161 @@ class RobotPipeline(object):
         batch = {
             'pc_fts': torch.from_numpy(pcd_ft).float(),
             'pc_labels': torch.from_numpy(pcd_label).long(),
+            'offset': torch.LongTensor([pcd_xyz.shape[0]]),
+            'npoints_in_batch': [pcd_xyz.shape[0]],
+            'pc_centroids': pc_centroid,
+            'pc_radius': pc_radius,
+            'ee_poses': torch.from_numpy(gripper_pose).float().unsqueeze(0),
+        }
+
+        action_name = plan['action']
+        if plan['target'] in ['up', 'down', 'out', 'in']:
+            action_name = action_name + ' ' + plan['target']
+        if instr_include_objects:
+            if 'object' in plan and plan['object'] is not None:
+                object_name = ''.join([x for x in plan['object'] if not x.isdigit()])
+                object_name = object_name.replace('_', ' ').strip()
+                action_name = f"{action_name} {object_name}"
+            if 'target' in plan and plan['target'] is not None and plan['target'] not in ['up', 'down', 'out', 'in']:
+                target_name = ''.join([x for x in plan['target'] if not x.isdigit()])
+                target_name = target_name.replace('_', ' ').strip()
+                action_name = f"{action_name} to {target_name}"
+        # print('action name', action_name)
+
+        action_embeds = self.clip_model(
+            'text', action_name, use_prompt=False, output_hidden_states=True
+        )[0]    # shape=(txt_len, hidden_size)
+        batch.update({
+            'txt_embeds': action_embeds,
+            'txt_lens':  [action_embeds.size(0)],
+        })
+
+        extra_outs = EasyDict()
+        if len(mani_obj) > 0:
+            extra_outs.mani_obj = mani_obj
+        return batch, extra_outs
+
+    def soft_classification_input(
+        self, vlm_results, plan, arm_links_info, gripper_pose, voxel_size=0.01, 
+        rm_robot='none', num_points=4096, same_npoints_per_example=False,
+        xyz_shift='center', xyz_norm=False, use_height=False, zrange=None,
+        target_var_xyz=None, use_color=False, instr_include_objects=False,
+    ):
+        pcd_xyz, pcd_rgb, pcd_label = [], [], []
+        for k, obj_data in enumerate(vlm_results.objects):
+            pcd_xyz.append(obj_data.pcd_xyz)
+            pcd_rgb.append(obj_data.pcd_rgb)
+            pcd_label.append(np.zeros((obj_data.pcd_xyz.shape[0], 4), dtype=np.int32))
+            # print('obj', k, obj_data.captions, len(obj_data.pcd_xyz))
+            if len(obj_data.captions) > 0 and obj_data.captions[0] == 'robot':
+                pcd_label[-1][:,1] = 1
+
+        mani_obj = EasyDict()
+        
+        # 0: obstacle, 1: robot, 2: object, 3: target
+        for query_key in ['object', 'target']:
+            if plan[query_key] is not None:
+                query = plan[query_key]
+                # coarse-grained object grounding
+                best_obj_id, _, pred_sim = self.vlm_pipeline.ground_object_with_query(
+                    query, objects=vlm_results.objects, debug=False, return_sims=True
+                )
+                confidence_score = scipy.special.softmax(np.array(pred_sim))
+                if best_obj_id is not None:
+                    # print(query, best_obj_id, pred_sim)
+                    if query_key == 'object':
+                        for i in range(len(pcd_label)):
+                            pcd_label[i][:,2] = confidence_score[i]
+                            if zrange is not None:
+                                pcd_label[i][pcd_xyz[i][:, 2] < zrange[0]] = 0
+                                pcd_label[i][pcd_xyz[i][:, 2] > zrange[1]] = 0
+                        mani_obj.pcd_xyz = pcd_xyz[best_obj_id]
+                        mani_obj.name = plan['ret_val']
+                    elif query_key == 'target':
+                        if target_var_xyz is not None:
+                            target_var_xyz = torch.from_numpy(target_var_xyz).float().to(self.device).unsqueeze(0)
+                            obj_target_var_dists = [self.vlm_pipeline.chamfer_dist_fn(
+                                target_var_xyz, 
+                                torch.from_numpy(obj.pcd_xyz).float().to(self.device).unsqueeze(0),
+                                bidirectional=True
+                                )[0].item()
+                                for obj in vlm_results.objects if len(obj.captions) == 0]
+                            best_obj_id = np.argmin(obj_target_var_dists)
+                            pcd_label[best_obj_id][:,1] = 1
+                            # print('target var', obj_target_var_dists, best_obj_id)
+                            if zrange is not None:
+                                pcd_label[best_obj_id][pcd_xyz[best_obj_id][:, 2] < zrange[0]] = 0
+                                pcd_label[best_obj_id][pcd_xyz[best_obj_id][:, 2] > zrange[1]] = 0
+                        else:
+                            for i in range(len(pcd_label)):
+                                pcd_label[i][:,3] = confidence_score[i]
+                                if zrange is not None:
+                                    pcd_label[i][pcd_xyz[i][:, 2] < zrange[0]] = 0
+                                    pcd_label[i][pcd_xyz[i][:, 2] > zrange[1]] = 0
+
+        pcd_xyz = np.concatenate(pcd_xyz)
+        pcd_rgb = np.concatenate(pcd_rgb)
+        pcd_label = np.concatenate(pcd_label,axis=0)
+        pcd_label[:,0] = 1 - pcd_label[:,1:].sum(1)
+        pcd_label = scipy.special.softmax(pcd_label, axis=1)
+        # print('merged', pcd_xyz.shape, collections.Counter(pcd_label))
+        
+        # point cloud preprocessing
+        pcd_xyz, idxs = voxelize_pcd(pcd_xyz, voxel_size=voxel_size)
+        pcd_label = pcd_label[idxs]
+        pcd_rgb = pcd_rgb[idxs]
+        
+        if rm_robot != 'none':
+            if rm_robot == 'box':
+                robot_box = RobotBox(arm_links_info, keep_gripper=False, env_name=self.env_name)
+            elif rm_robot == 'box_keep_gripper':
+                robot_box = RobotBox(arm_links_info, keep_gripper=True, env_name=self.env_name)
+            robot_point_idxs = robot_box.get_pc_overlap_ratio(xyz=pcd_xyz, return_indices=True)[1]
+            robot_point_idxs = np.array(list(robot_point_idxs))
+            if len(robot_point_idxs) > 0:
+                mask = np.ones((pcd_xyz.shape[0], ), dtype=bool)
+                mask[robot_point_idxs] = False
+                pcd_xyz = pcd_xyz[mask]
+                pcd_label = pcd_label[mask]
+                pcd_rgb = pcd_rgb[mask]
+        
+        # sample points
+        if len(pcd_xyz) > num_points:
+            point_idxs = np.random.permutation(len(pcd_xyz))[:num_points]
+        else:
+            if same_npoints_per_example:
+                point_idxs = np.random.choice(pcd_xyz.shape[0], num_points, replace=True)
+            else:
+                point_idxs = np.arange(pcd_xyz.shape[0])
+        pcd_xyz = pcd_xyz[point_idxs]
+        pcd_label = pcd_label[point_idxs]
+        pcd_height = pcd_xyz[:, 2] - self.workspace['TABLE_HEIGHT']
+        pcd_rgb = pcd_rgb[point_idxs]
+
+        # normalize point cloud
+        if xyz_shift == 'none':
+            pc_centroid = np.zeros((3, ))
+        elif xyz_shift == 'center':
+            pc_centroid = np.mean(pcd_xyz, 0)
+        elif xyz_shift == 'gripper':
+            pc_centroid = copy.deepcopy(gripper_pose[:3])
+        if xyz_norm:
+            pc_radius = np.max(np.sqrt(np.sum((pcd_xyz - pc_centroid) ** 2, axis=1)))
+        else:
+            pc_radius = 1
+        pcd_xyz = (pcd_xyz - pc_centroid) / pc_radius
+        gripper_pose[:3] = (gripper_pose[:3] - pc_centroid) / pc_radius
+
+        pcd_ft = pcd_xyz
+        if use_height:
+            pcd_ft = np.concatenate([pcd_ft, pcd_height[:, None]], -1)
+        if use_color:
+            pcd_rgb = (pcd_rgb / 255.) * 2 - 1
+            pcd_ft = np.concatenate([pcd_ft, pcd_rgb], -1)
+
+        batch = {
+            'pc_fts': torch.from_numpy(pcd_ft).float(),
+            'pc_labels': torch.from_numpy(pcd_label).float(),
             'offset': torch.LongTensor([pcd_xyz.shape[0]]),
             'npoints_in_batch': [pcd_xyz.shape[0]],
             'pc_centroids': pc_centroid,
@@ -358,7 +513,7 @@ class RobotPipeline(object):
             if zrange is not None:
                 zrange += self.workspace['TABLE_HEIGHT']
             
-        batch, extra_outs = self.prepare_motion_planner_input(
+        batch, extra_outs = self.soft_classification_input(
             vlm_results, plan,
             arm_links_info, gripper_pose, 
             voxel_size=self.mp_config.MODEL.action_config.voxel_size,
@@ -368,7 +523,7 @@ class RobotPipeline(object):
             xyz_shift=self.mp_config.TRAIN_DATASET.xyz_shift,
             xyz_norm=self.mp_config.TRAIN_DATASET.xyz_norm,
             use_height=self.mp_config.TRAIN_DATASET.use_height,
-            use_color=self.mp_config.TRAIN_DATASET.get('use_color', False),
+            use_color=self.mp_config.TRAIN_DATASET.get('use_color', True),
             instr_include_objects=self.mp_config.TRAIN_DATASET.get('instr_include_objects', False),
             zrange=zrange,
             target_var_xyz=target_var_xyz,

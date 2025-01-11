@@ -195,7 +195,8 @@ class MotionPlannerPTV3AdaNorm(BaseModel):
             'batch': offset2batch(batch['offset']),
             'feat': batch['pc_fts'],
         }
-        pc_label_embeds = self.pc_label_embedding(batch['pc_labels'])
+        pc_label_embeds = (self.pc_label_embedding(torch.LongTensor([0, 1, 2, 3],device=batch['pc_labels'].device))[None,None,:]*batch['pc_labels']).sum(dim=1)
+        #pc_label_embeds = self.pc_label_embedding(batch['pc_labels'])
         outs['feat'] = torch.cat([outs['feat'], pc_label_embeds], dim=-1)
 
         # encode context for each point cloud
@@ -442,7 +443,8 @@ class MotionPlannerPTV3CA(MotionPlannerPTV3AdaNorm):
             'batch': offset2batch(batch['offset']),
             'feat': batch['pc_fts'],
         }
-        pc_label_embeds = self.pc_label_embedding(batch['pc_labels'])
+        pc_label_embeds = (self.pc_label_embedding(torch.LongTensor([0, 1, 2, 3]).to(device=batch['pc_labels'].device))[None,:,:]*batch['pc_labels'][:,:,None]).sum(dim=1)
+        #pc_label_embeds = self.pc_label_embedding(batch['pc_labels'])
         outs['feat'] = torch.cat([outs['feat'], pc_label_embeds], dim=-1)
 
         device = batch['pc_fts'].device
